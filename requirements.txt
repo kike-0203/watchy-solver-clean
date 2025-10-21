@@ -1,0 +1,6 @@
+﻿fastapi
+uvicorn[standard]
+pillow
+matplotlib
+openai
+python-multipart
