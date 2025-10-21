@@ -1,115 +1,100 @@
-﻿import io, uuid, os
-from typing import List
-from fastapi import FastAPI, UploadFile, File, Response, HTTPException
-from pydantic import BaseModel
-from PIL import Image, ImageOps
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse, Response
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+import base64, hashlib, os, textwrap, tempfile
+from openai import OpenAI
 
-CANVAS_W, CANVAS_H = 200, 200
-PADDING = 8
-UPSCALE = 4
 OPENAI_MODEL = "gpt-4o-mini"
-PAGE_STORE: dict[str, list[bytes]] = {}
-
-try:
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    USE_RESPONSES = True
-except Exception:
-    USE_RESPONSES = False
-
 PROMPT_ES = (
-    "Lee la imagen y extrae el problema de cálculo/EDO. "
-    "Resuélvelo paso a paso y devuelve SOLO un bloque LaTeX con display math, "
-    "usando el entorno aligned. No agregues nada fuera del bloque. "
-    "Reglas para pantalla 200x200: pasos cortos; divide con \\\\ si hace falta.\n\n"
-    "Plantilla EXACTA:\n"
-    "\\[\n"
-    "\\begin{aligned}\n"
-    "% líneas con \\\\ por salto\n"
-    "\\end{aligned}\n"
-    "\\]\n"
+    "Analiza cuidadosamente el texto o ecuación en la imagen y responde "
+    "explicando la solución de manera breve y en formato matemático LaTeX, "
+    "sin texto adicional ni comentarios. Si es una ecuación diferencial, resuélvela paso a paso."
 )
-
-def ask_openai_vision(image_bytes: bytes) -> str:
-    if not USE_RESPONSES:
-        raise HTTPException(500, "SDK de OpenAI no disponible en entorno")
-    msg = [
-        {"role": "user", "content": [
-            {"type":"input_text","text":PROMPT_ES},
-            {"type":"input_image","image_bytes": image_bytes}
-        ]}
-    ]
-    res = client.responses.create(model=OPENAI_MODEL, input=msg)
-    return res.output_text.strip()
-
-def latex_block_to_rgba(latex_block: str, scale=UPSCALE) -> Image.Image:
-    clean = latex_block.replace("\\[", "").replace("\\]", "").strip()
-    fig = plt.figure(figsize=(3, 12), dpi=100*scale)
-    fig.patch.set_alpha(0.0)
-    ax = fig.add_axes([0, 0, 1, 1]); ax.axis("off")
-    ax.text(0.02, 0.98, f"$\\displaystyle {clean}$",
-            ha="left", va="top", fontsize=24*scale)
-    buf = io.BytesIO(); plt.savefig(buf, format="png", transparent=True, dpi=100*scale)
-    plt.close(fig); buf.seek(0)
-    img = Image.open(buf).convert("RGBA")
-    bbox = img.getbbox()
-    return img.crop(bbox) if bbox else img
-
-def compose_to_pages(rgba: Image.Image) -> List[Image.Image]:
-    white_bg = Image.new("RGBA", rgba.size, (255,255,255,255))
-    imgL = Image.alpha_composite(white_bg, rgba).convert("L")
-    max_w = CANVAS_W - 2*PADDING
-    scale = min(1.0, max_w / imgL.width)
-    new_w, new_h = int(imgL.width*scale), int(imgL.height*scale)
-    imgL = imgL.resize((new_w, new_h), Image.LANCZOS)
-    page_h = CANVAS_H - 2*PADDING
-
-    pages = []
-    y = 0
-    while y < new_h:
-        slice_h = min(page_h, new_h - y)
-        crop = imgL.crop((0, y, new_w, y + slice_h))
-        canvas = Image.new("L", (CANVAS_W, CANVAS_H), 255)
-        canvas.paste(crop, ((CANVAS_W - new_w)//2, PADDING))
-        canvas = ImageOps.unsharp_mask(canvas, radius=1, percent=130, threshold=2)
-        pages.append(canvas); y += slice_h
-    return pages
-
-def to_pbm_p4(imgL: Image.Image) -> bytes:
-    mono = imgL.convert("1", dither=Image.FLOYDSTEINBERG)
-    w, h = mono.size
-    return f"P4\n{w} {h}\n".encode("ascii") + mono.tobytes()
 
 app = FastAPI()
 
-class SolveResponse(BaseModel):
-    token: str
-    pages: int
+TMP = tempfile.gettempdir()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-@app.post("/solve_image", response_model=SolveResponse)
+# --- nueva función corregida ---
+def ask_openai_vision(image_bytes: bytes) -> str:
+    """
+    Envía la imagen como data URL (base64) para evitar 'bytes no serializable'.
+    Intenta primero la Responses API (SDK nuevo) y cae a Chat Completions si falla.
+    """
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:image/png;base64,{b64}"
+
+    # Ruta 1: SDK nuevo (Responses API)
+    try:
+        msg = [
+            {"role": "user", "content": [
+                {"type": "input_text", "text": PROMPT_ES},
+                {"type": "input_image", "image_url": {"url": data_url}}
+            ]}
+        ]
+        res = client.responses.create(model=OPENAI_MODEL, input=msg)
+        if hasattr(res, "output_text"):
+            return res.output_text.strip()
+        try:
+            return res.output[0].content[0].text.strip()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Ruta 2: fallback a Chat Completions multimodal
+    import openai as openai_legacy
+    openai_legacy.api_key = os.getenv("OPENAI_API_KEY")
+    r = openai_legacy.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PROMPT_ES},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }]
+    )
+    return r.choices[0].message["content"].strip()
+
+
+def latex_block_to_rgba(text: str, page_w=200, page_h=200) -> list[Image.Image]:
+    """
+    Convierte el texto de salida (LaTeX plano o normal) a páginas 200x200 píxeles PBM.
+    """
+    lines = textwrap.wrap(text, width=24)
+    per_page = page_h // 14
+    pages = []
+    for i in range(0, len(lines), per_page):
+        img = Image.new("1", (page_w, page_h), 1)
+        d = ImageDraw.Draw(img)
+        y = 10
+        for line in lines[i:i + per_page]:
+            d.text((10, y), line, fill=0)
+            y += 14
+        pages.append(img)
+    return pages
+
+
+@app.post("/solve_image")
 async def solve_image(file: UploadFile = File(...)):
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(500, "Falta OPENAI_API_KEY")
     img_bytes = await file.read()
     latex = ask_openai_vision(img_bytes)
-    rgba = latex_block_to_rgba(latex)
-    pbms = [to_pbm_p4(p) for p in compose_to_pages(rgba)]
-    token = uuid.uuid4().hex[:12]
-    PAGE_STORE[token] = pbms
-    return {"token": token, "pages": len(pbms)}
+    token = hashlib.sha1(img_bytes).hexdigest()[:12]
+    pages = latex_block_to_rgba(latex)
+    os.makedirs(os.path.join(TMP, token), exist_ok=True)
+    for i, p in enumerate(pages):
+        p.save(os.path.join(TMP, token, f"{i}.pbm"))
+    return JSONResponse({"token": token, "pages": len(pages)})
 
-@app.get("/manifest/{token}")
-def manifest(token: str):
-    pages = PAGE_STORE.get(token)
-    if pages is None: raise HTTPException(404, "Token no encontrado")
-    return {"token": token, "pages": len(pages)}
 
-@app.get("/pbm/{token}/{i}")
-def get_pbm(token: str, i: int):
-    pages = PAGE_STORE.get(token)
-    if pages is None or not (0 <= i < len(pages)):
-        raise HTTPException(404, "Página no encontrada")
-    return Response(content=pages[i], media_type="image/x-portable-bitmap")
+@app.get("/pbm/{token}/{page}")
+async def get_pbm(token: str, page: int):
+    path = os.path.join(TMP, token, f"{page}.pbm")
+    if not os.path.exists(path):
+        return JSONResponse({"error": "No existe esa página"}, status_code=404)
+    return Response(content=open(path, "rb").read(), media_type="image/x-portable-bitmap")
+
